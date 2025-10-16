@@ -10,6 +10,7 @@ import customtkinter as ctk
 import csv
 import pyperclip
 from threading import Thread
+import threading
 from concurrent.futures import ThreadPoolExecutor
 import multiprocessing
 
@@ -37,6 +38,10 @@ class MD5HasherApp:
         self.time_est = tk.StringVar(value="Estimated time: N/A")
         self.results_text = ""
         self.results_csv = []
+        self.bytes_processed = tk.DoubleVar(value=0)
+        self.total_size = 0
+        self.lock = threading.Lock()
+        self.is_hashing = False  # Flag to control the monitor
 
         # UI Elements
         self.create_ui()
@@ -163,7 +168,7 @@ class MD5HasherApp:
 
         self.results_area.delete("1.0", "end")
         self.progress.set(0)
-        self.time_est.set("Estimated time: Calculating...")
+        self.time_est.set("Estimated time: N/A")
         self.results_text = ""
         self.results_csv = []
 
@@ -171,36 +176,68 @@ class MD5HasherApp:
         thread.start()
 
     def hash_file(self, file_path):
-        """Hash a single file and return its result."""
+        """Hash a single file and return its result, updating bytes processed."""
         hash_md5 = hashlib.md5()
+        file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
         try:
             with open(file_path, "rb") as f:
-                # Use 128KB buffer for faster I/O
                 for chunk in iter(lambda: f.read(131072), b""):
                     hash_md5.update(chunk)
+                    with self.lock:
+                        self.bytes_processed.set(self.bytes_processed.get() + len(chunk))
             md5_hash = hash_md5.hexdigest()
             filename = os.path.basename(file_path)
             return {"Filename": filename, "Path": file_path, "MD5 Hash": md5_hash, "Error": None}
         except Exception as e:
+            # On error, still "process" the full file size to avoid stalling progress
+            with self.lock:
+                self.bytes_processed.set(self.bytes_processed.get() + file_size)
             return {"Filename": os.path.basename(file_path), "Path": file_path, "MD5 Hash": None, "Error": str(e)}
+
+    def monitor_progress(self, start_time):
+        while self.is_hashing:
+            if self.total_size > 0:
+                current_progress = min(self.bytes_processed.get() / self.total_size * 100, 100)
+                self.progress.set(current_progress)
+                elapsed = time.time() - start_time
+                if current_progress > 0:
+                    est_total = elapsed / (current_progress / 100)
+                    est_remaining = max(est_total - elapsed, 0)
+                    self.time_est.set(f"Estimated time remaining: {int(est_remaining)} seconds")
+            time.sleep(0.5)  # Update every 0.5 seconds
+        # Final update when done
+        self.progress.set(100)
+        self.time_est.set("Completed.")
 
     def calculate_hashes(self):
         all_files = self.get_all_files()
-        total_files = len(all_files)
-        if total_files == 0:
+        if not all_files:
             self.results_area.insert("end", "No files found to hash.\n")
             return
 
+        self.total_size = sum(os.path.getsize(f) for f in all_files if os.path.exists(f))
+        if self.total_size == 0:
+            self.results_area.insert("end", "All files are empty or inaccessible.\n")
+            return
+
+        self.results_area.delete("1.0", "end")
+        self.progress.set(0)
+        self.bytes_processed.set(0)
+        self.time_est.set("Estimated time: Calculating...")
+        self.results_text = ""
+        self.results_csv = []
+        self.is_hashing = True
+
         start_time = time.time()
-        processed = 0
-        update_interval = max(10, total_files // 100)  # Update every 1% or 10 files
+        monitor_thread = Thread(target=self.monitor_progress, args=(start_time,))
+        monitor_thread.start()
 
-        # Use ThreadPoolExecutor for parallel file hashing
+        from concurrent.futures import as_completed
+
         with ThreadPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
-            results = executor.map(self.hash_file, all_files)
-
-            for result in results:
-                processed += 1
+            futures = [executor.submit(self.hash_file, f) for f in all_files]
+            for fut in as_completed(futures):
+                result = fut.result()
                 if result["Error"]:
                     error = f"Error hashing {result['Path']}: {result['Error']}\n"
                     self.results_text += error
@@ -210,16 +247,10 @@ class MD5HasherApp:
                     self.results_text += result_text
                     self.results_area.insert("end", result_text)
                     self.results_csv.append(result)
+                self.results_area.see("end")
 
-                # Update progress bar less frequently
-                if processed % update_interval == 0 or processed == total_files:
-                    self.progress.set((processed / total_files) * 100)
-                    elapsed = time.time() - start_time
-                    if processed > 0:
-                        est_total = (elapsed / processed) * total_files
-                        est_remaining = est_total - elapsed
-                        self.time_est.set(f"Estimated time remaining: {int(est_remaining)} seconds")
-                    self.results_area.see("end")
+        self.is_hashing = False
+        monitor_thread.join()  # Wait for monitor to finish
 
         # Write to TXT report if selected
         if self.output_report_txt.get() and self.report_txt_path.get():
@@ -234,11 +265,8 @@ class MD5HasherApp:
                 writer.writeheader()
                 for row in self.results_csv:
                     if row["MD5 Hash"]:  # Only write successful hashes
-                        # Filter out the 'Error' key
                         filtered_row = {key: row[key] for key in fieldnames}
                         writer.writerow(filtered_row)
-
-        self.time_est.set("Completed.")
 
     def get_all_files(self):
         all_files = []
